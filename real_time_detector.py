@@ -1,10 +1,22 @@
+import os, warnings
 import serial
 import numpy as np
 import joblib
-from tensorflow.keras.models import load_model
+import threading
+import time
+
+# suppress oneDNN informational noise and sklearn warnings
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+warnings.filterwarnings('ignore')
+
+# use compatibility shim for Keras 2-style .keras models
+import tf_keras as keras
+
+# Import UI components
+from ui_detector import AnomalyDashboard, data_q
 
 # load trained model
-model = load_model("motor_anomaly_lstm.keras")
+model = keras.models.load_model("motor_anomaly_lstm.keras")
 
 # load scaler
 scaler = joblib.load("scaler.save")
@@ -12,45 +24,61 @@ scaler = joblib.load("scaler.save")
 # anomaly threshold
 threshold = 0.0628
 
-# connect to Arduino
-ser = serial.Serial("COM7", 9600)
+# Initialize UI
+app = AnomalyDashboard()
 
-sequence = []
+# Start real-time detection in a background thread
+def real_time_detect():
+    # connect to Arduino
+    ser = serial.Serial("COM7", 9600)
 
-print("Monitoring started...")
+    sequence = []
+    step = 0
 
-while True:
+    data_q.put({"log": "Real-time monitoring started..."})
 
-    line = ser.readline().decode().strip()
+    while True:
+        try:
+            line = ser.readline().decode().strip()
+            values = line.split(",")
 
-    values = line.split(",")
+            if len(values) != 8:
+                continue
 
-    if len(values) != 8:
-        continue
+            values_raw = np.array(values, dtype=float)
+            values_scaled = scaler.transform(np.array([values_raw]))[0]
 
-    values = np.array(values, dtype=float)
+            sequence.append(values_scaled)
 
-    # scale like training
-    values = scaler.transform(np.array([values]))[0]
+            if len(sequence) > 30:
+                sequence.pop(0)
 
-    sequence.append(values)
+            if len(sequence) == 30:
+                step += 1
+                X = np.array(sequence).reshape(1, 30, 8)
+                reconstruction = model.predict(X, verbose=0)
+                mse = float(np.mean(np.square(X - reconstruction)))
+                is_anomaly = mse > threshold
 
-    if len(sequence) > 30:
-        sequence.pop(0)
+                data_q.put({
+                    "step": step,
+                    "mse": mse,
+                    "anomaly": is_anomaly,
+                    "sensors": list(values_raw),
+                    "log": f"[{step:>4}] MSE={mse:.6f}  {'⚠ ANOMALY' if is_anomaly else '✓ Normal'}",
+                })
 
-    if len(sequence) == 30:
+                if is_anomaly:
+                    ser.write(b'1')
+                else:
+                    ser.write(b'0')
 
-        X = np.array(sequence).reshape(1, 30, 8)
+        except Exception as e:
+            data_q.put({"log": f"Error: {str(e)}"})
+            time.sleep(1)
 
-        reconstruction = model.predict(X, verbose=0)
+thread = threading.Thread(target=real_time_detect, daemon=True)
+thread.start()
 
-        mse = np.mean(np.square(X - reconstruction))
-
-        print("Error:", mse)
-
-        if mse > threshold:
-            ser.write(b'1')
-            print("ANOMALY DETECTED")
-        else:
-            ser.write(b'0')
-            print("NORMAL")
+# Start the UI
+app.mainloop()
